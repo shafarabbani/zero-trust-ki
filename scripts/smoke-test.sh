@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Fase 6: menjalankan semua skenario TESTING.md (T01-T30) terhadap stack yang SEDANG BERJALAN.
-# Persiapan yang disarankan (instalasi bersih):
-#   docker compose down -v && docker compose up --build -d && scripts/smoke-test.sh
-# Catatan: script mengubah ACCESS_HOURS di .env sementara (T17/T18/T30) lalu mengembalikannya.
+# Fase 6: menjalankan semua skenario TESTING.md (T01-T30) terhadap stack LOKAL tanpa Docker.
+# Persiapan: MySQL Laragon hidup + nilai_db termigrasi + 3 app jalan (npm start per folder).
+# Uji bersih:   bash scripts/smoke-test.sh --reset   (reset DB + seed ulang otomatis)
+# Catatan: script mengubah ACCESS_HOURS di .env sementara (T17/T18) lalu mengembalikannya.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -10,7 +10,25 @@ GW=http://localhost:3000
 BODY=/tmp/smoke-body.json
 PASS=0; FAIL=0
 
+# Path binary mysql Laragon; boleh ditimpa lewat env MYSQL_BIN.
+MYSQL_BIN=${MYSQL_BIN:-/c/laragon/bin/mysql/mysql-8.0.30-winx64/bin/mysql.exe}
+
 set -a; source .env; set +a
+
+# Jalankan SQL langsung ke MySQL Laragon (root lokal tanpa password).
+mysqlq() { "$MYSQL_BIN" -u root -h 127.0.0.1 nilai_db -N -e "$1" 2>/dev/null; }
+
+# Matikan SEMUA proses yang menyandang suatu port (dipakai untuk restart gateway/transkrip).
+kill_port() {
+  local pid
+  for pid in $(netstat -ano | grep -E ":$1 .*LISTENING" | awk '{print $5}' | sort -u); do
+    taskkill //PID "$pid" //F >/dev/null 2>&1
+  done
+  sleep 2
+}
+
+# Nyalakan ulang suatu app dari foldernya, terpisah dari script ini.
+start_app() { (cd "$1" && node --env-file=../.env src/server.js >/dev/null 2>&1 &) ; }
 
 check() { # $1=id $2=expected $3=actual
   if [ "$2" = "$3" ]; then echo "ok   $1 ($3)"; PASS=$((PASS+1));
@@ -37,7 +55,11 @@ set_hours() { # $1=start $2=end
   grep -v -E '^ACCESS_HOURS_(START|END)=' .env > .env.tmp
   printf 'ACCESS_HOURS_START=%s\nACCESS_HOURS_END=%s\n' "$1" "$2" >> .env.tmp
   mv .env.tmp .env
-  docker compose up -d --force-recreate gateway >/dev/null 2>&1
+  # Penting: node --env-file TIDAK menimpa variabel yang sudah ada di environment,
+  # jadi nilai baru harus ikut di-export ke environment script ini (diturunkan ke gateway).
+  export ACCESS_HOURS_START=$1 ACCESS_HOURS_END=$2
+  kill_port 3000
+  start_app gateway
   wait_gw
 }
 
@@ -57,11 +79,17 @@ expect() { local id=$1 es=$2 er=$3; shift 3
 login() { curl -s -X POST $GW/auth/login -H 'Content-Type: application/json' -H "X-Device-ID: $2" \
   -d "{\"email\":\"$1\",\"password\":\"Password123!\"}"; }
 token_of() { login "$1" "$2" | jsonget .data.accessToken; }
-mysqlq() { docker compose exec -T mysql mysql -uroot -p"$MYSQL_ROOT_PASSWORD" nilai_db -N -e "$1" 2>/dev/null; }
 
-# Menunggu dengan polling (bukan sleep tetap): container yang baru dibuat ulang bisa butuh waktu berbeda.
+# Menunggu dengan polling: proses node yang baru_start_ bisa butuh waktu berbeda.
 wait_gw() { for _ in $(seq 1 40); do curl -sf $GW/health >/dev/null 2>&1 && return 0; sleep 1; done; echo "GAGAL: gateway tidak siap"; return 1; }
-wait_transkrip() { for _ in $(seq 1 40); do docker compose exec -T service-transkrip node healthcheck.js 3002 >/dev/null 2>&1 && return 0; sleep 1; done; echo "GAGAL: service-transkrip tidak siap"; return 1; }
+wait_transkrip() { for _ in $(seq 1 40); do curl -sf http://localhost:3002/health >/dev/null 2>&1 && return 0; sleep 1; done; echo "GAGAL: service-transkrip tidak siap"; return 1; }
+
+if [ "${1:-}" = "--reset" ]; then
+  echo "== reset database nilai_db (drop + migrate + seed) =="
+  "$MYSQL_BIN" -u root -h 127.0.0.1 -e "DROP DATABASE IF EXISTS nilai_db; CREATE DATABASE nilai_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  (cd database && npx prisma migrate deploy >/dev/null 2>&1)
+  (cd database && node --env-file=../.env prisma/seed.js >/dev/null 2>&1)
+fi
 
 echo "== menunggu gateway =="
 wait_gw
@@ -86,7 +114,7 @@ RT2=$(login mhs2@unsil.test MHS2-HP-01 | jsonget .data.refreshToken)
 check T06a 200 "$(httpcode -X POST $GW/auth/logout -H 'Content-Type: application/json' -d "{\"refreshToken\":\"$RT2\"}")"
 expect T06b 401 REFRESH_REVOKED -X POST $GW/auth/refresh -H 'Content-Type: application/json' -d "{\"refreshToken\":\"$RT2\"}"
 
-EXPTOK=$(docker compose exec gateway node -e 'const j=require("jsonwebtoken");console.log(j.sign({sub:"x",role:"DOSEN",type:"access"},process.env.JWT_SECRET,{expiresIn:-10,issuer:process.env.JWT_ISSUER}))' | tr -d '\r')
+EXPTOK=$(cd gateway && node --env-file=../.env -e 'const j=require("jsonwebtoken");console.log(j.sign({sub:"x",role:"DOSEN",type:"access"},process.env.JWT_SECRET,{expiresIn:-10,issuer:process.env.JWT_ISSUER}))' | tr -d '\r')
 expect T07 401 TOKEN_EXPIRED $GW/nilai -H "Authorization: Bearer $EXPTOK" -H 'X-Device-ID: DOSEN1-LAPTOP-01'
 ST=$(curl -s -X POST $GW/auth/service -H 'Content-Type: application/json' -d "{\"clientId\":\"$SERVICE_NILAI_CLIENT_ID\",\"clientSecret\":\"$SERVICE_NILAI_CLIENT_SECRET\"}")
 check T08a 300 "$(jsonget .data.expiresIn <<< "$ST")"
@@ -134,11 +162,10 @@ expect T23b 403 ROLE_NOT_ALLOWED $GW/transkrip/247006111001 -H "Authorization: B
 expect T24a 403 SERVICE_ONLY -X POST $GW/transkrip/sinkron -H "Authorization: Bearer $ADMIN" -H 'X-Device-ID: ADMIN-LAPTOP-01' -H 'Content-Type: application/json' -d '{}'
 expect T24b 403 SERVICE_ONLY -X POST $GW/transkrip/sinkron -H "Authorization: Bearer $DOSEN1" -H 'X-Device-ID: DOSEN1-LAPTOP-01' -H 'Content-Type: application/json' -d '{}'
 
-docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d >/dev/null 2>&1; sleep 4
+# Mode lokal: serviceNilai sudah mendengarkan port 3001 di host, jadi uji akses langsung berjalan alami.
 expect T25a 403 GATEWAY_SECRET_INVALID localhost:3001/nilai
 expect T25b 401 TOKEN_MISSING localhost:3001/nilai -H "X-Gateway-Secret: $GATEWAY_SECRET"
 expect T25c 401 TOKEN_INVALID localhost:3001/nilai -H "X-Gateway-Secret: $GATEWAY_SECRET" -H "Authorization: Bearer token-palsu"
-docker compose -f docker-compose.yml up -d >/dev/null 2>&1
 
 expect T26 403 TOKEN_TYPE_INVALID $GW/nilai -H "Authorization: Bearer $SVC"
 
@@ -151,9 +178,9 @@ mysqlq "UPDATE nilai SET score=NULL WHERE id='$NILAI_B';"
 expect T29 422 NILAI_KOSONG -X POST $GW/kelas/$KELAS_B/finalisasi -H "Authorization: Bearer $DOSEN2" -H 'X-Device-ID: DOSEN2-LAPTOP-01'
 mysqlq "UPDATE nilai SET score=$SCORE_B WHERE id='$NILAI_B';"
 
-docker compose stop service-transkrip >/dev/null 2>&1; sleep 2
+kill_port 3002
 expect T30a 502 SINKRON_TRANSKRIP_GAGAL -X POST $GW/kelas/$KELAS_B/finalisasi -H "Authorization: Bearer $DOSEN2" -H 'X-Device-ID: DOSEN2-LAPTOP-01'
-docker compose start service-transkrip >/dev/null 2>&1; wait_transkrip
+start_app service-transkrip; wait_transkrip
 expect T30b 200 "" -X POST $GW/kelas/$KELAS_B/finalisasi -H "Authorization: Bearer $DOSEN2" -H 'X-Device-ID: DOSEN2-LAPTOP-01'
 
 echo "== T27 audit: setiap keputusan di atas harus punya barisnya =="

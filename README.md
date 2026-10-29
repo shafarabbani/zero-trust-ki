@@ -19,6 +19,32 @@ Dokumen lengkap: [docs/PLAN.md](docs/PLAN.md) · [docs/ARCHITECTURE.md](docs/ARC
 
 ## 1. Cara menjalankan
 
+### 1A. Mode lokal tanpa Docker (dipakai di laptop ini — MySQL dari Laragon)
+
+Prasyarat: Node 22+, Laragon dinyalakan (MySQL 8.0 di `127.0.0.1:3306`, root tanpa password).
+
+```bash
+cp .env.example .env    # lalu isi secret + ubah 4 baris ini untuk mode lokal:
+# DATABASE_URL=mysql://root@127.0.0.1:3306/nilai_db
+# NILAI_URL=http://127.0.0.1:3001   TRANSKRIP_URL=http://127.0.0.1:3002   GATEWAY_URL=http://127.0.0.1:3000
+
+bash scripts/setup-lokal.sh   # sekali saja: buat DB, npm install, salin schema + prisma generate, migrasi, seed
+
+# jalankan 3 aplikasi (3 terminal terpisah, dari folder masing-masing):
+cd gateway           && npm start
+cd service-nilai     && npm start
+cd service-transkrip && npm start
+```
+
+`npm start` memakai `node --env-file=../.env src/server.js` — flag `--env-file` itulah yang memuat `.env`;
+tanpa flag itu (mis. `node src/server.js`) muncul error "konfigurasi env tidak valid".
+
+Uji: `bash scripts/smoke-test.sh --reset` (reset DB + seed ulang, lalu T01–T30) dan `bash scripts/show-audit.sh`.
+Catatan: jangan menjalankan smoke test sambil membuka instance `npm start` sendiri — script mematikan dan
+menyalakan ulang gateway/service untuk skenario jam akses (T18) dan kegagalan sinkron (T30).
+
+### 1B. Mode Docker
+
 Prasyarat: Docker + Docker Compose.
 
 ```bash
@@ -66,8 +92,8 @@ di `.env`). Di luar itu: 403 `OUTSIDE_ACCESS_HOURS` (tetap tercatat di audit).
 
 ```bash
 # contoh membuka jendela sempit untuk demo penolakan di siang hari:
-sed -i '' 's/^ACCESS_HOURS_START=.*/ACCESS_HOURS_START=1/;s/^ACCESS_HOURS_END=.*/ACCESS_HOURS_END=2/' .env
-docker compose up -d --force-recreate gateway
+# ubah ACCESS_HOURS_START=1 dan ACCESS_HOURS_END=2 di .env, lalu restart gateway (Ctrl+C di terminalnya, npm start lagi)
+# mode docker: docker compose up -d --force-recreate gateway
 ```
 
 ## 4. Postman & demo video
@@ -79,7 +105,8 @@ Import [`postman/Sistem Nilai Zero Trust.postman_collection.json`](postman):
   (permintaan soal). Klik atas ke bawah; token & id captured otomatis oleh test script.
 - **Isi dulu 2 variabel collection** dari `.env` Anda: `gatewaySecret` dan
   `serviceClientSecret` (untuk uji akses langsung ke service).
-- Untuk request demo 06–07 (akses langsung ditolak), jalankan dengan overlay demo:
+- Untuk request demo 06–07 (akses langsung ditolak): tidak perlu langkah tambahan di mode lokal —
+  service memang mendengarkan port 3001/3002 di host. Di mode Docker pakai overlay:
   `docker compose -f docker-compose.yml -f docker-compose.demo.yml up -d`
 
 Tips jam: rekam sebelum 21.00 WIB agar langkah "PUT nilai" (boleh) dan langkah 23
@@ -88,9 +115,10 @@ Tips jam: rekam sebelum 21.00 WIB agar langkah "PUT nilai" (boleh) dan langkah 2
 ## 5. Uji otomatis (T01–T30)
 
 ```bash
-docker compose down -v && docker compose up --build -d
-bash scripts/smoke-test.sh        # harus keluar dengan kode 0 (LULUS=60 GAGAL=0)
-bash scripts/show-audit.sh        # 20 keputusan audit terakhir
+# mode lokal (3 app sudah berjalan):
+bash scripts/smoke-test.sh --reset   # reset DB + seed, lalu T01–T30; harus LULUS=60 GAGAL=0 (kode keluar 0)
+bash scripts/show-audit.sh           # 20 keputusan audit terakhir
+# mode docker: docker compose down -v && docker compose up --build -d, lalu jalankan kedua skrip di atas
 ```
 
 ## 6. Troubleshooting
@@ -99,6 +127,7 @@ bash scripts/show-audit.sh        # 20 keputusan audit terakhir
 |---|---|---|
 | `db-init` gagal saat start pertama | MySQL belum benar-benar siap | sudah diatasi retry otomatis; cek `docker compose logs db-init` |
 | Gateway mati saat start | `.env` kosong / secret < 32 karakter | pesan error menyebut nama variabel yang hilang |
+| "konfigurasi env tidak valid: DATABASE_URL Required" | jalan `node src/server.js` langsung / tanpa `.env` di folder tsb | pakai `npm start` dari folder app (memuat `--env-file=../.env`) |
 | 403 `DEVICE_*` saat login | lupa header `X-Device-ID` / device bukan milik user itu | pakai tabel akun di atas |
 | 403 `OUTSIDE_ACCESS_HOURS` | di luar 07–21 WIB | lihat §3 |
 | 401 `TOKEN_EXPIRED` | access token > 10 menit | `POST /auth/refresh` |
